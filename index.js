@@ -30,7 +30,14 @@ const connectionProfilesStatus = document.createElement('div');
 const connectionProfilesSelect = document.createElement('select');
 const connectionProfilesIcon = document.createElement('img');
 
-const icons = [
+// State variables for message navigation and editing
+let currentMessageIndex = -1;
+let currentlyEditingMessage = null;
+let editStateObserver = null;
+
+let isChatInOperationMode = false;
+
+const outOfChatIcons = [
     {
         id: 'extensionTopBarToggleSidebar',
         icon: 'fa-fw fa-solid fa-box-archive',
@@ -45,6 +52,30 @@ const icons = [
         title: t`Show connection profiles`,
         isTemporaryAllowed: true,
         onClick: onToggleConnectionProfilesClick,
+    },
+    {
+        id: 'extensionTopBarConfirmEdit',
+        icon: 'fa-fw fa-solid fa-check',
+        position: 'right',
+        title: t`Confirm edit`,
+        onClick: onConfirmEditClick,
+        isHidden: true,
+    },
+    {
+        id: 'extensionTopBarCancelEdit',
+        icon: 'fa-fw fa-solid fa-xmark',
+        position: 'right',
+        title: t`Cancel edit`,
+        onClick: onCancelEditClick,
+        isHidden: true,
+    },
+    {
+        id: 'extensionTopBarDeleteEdited',
+        icon: 'fa-fw fa-solid fa-trash-can',
+        position: 'right',
+        title: t`Delete this message`,
+        onClick: onDeleteEditedClick,
+        isHidden: true,
     },
     {
         id: 'extensionTopBarChatManager',
@@ -91,6 +122,244 @@ const icons = [
     },
 ];
 
+const inChatIcons = [
+    {
+        id: 'extensionTopBarNavUp',
+        icon: 'fa-fw fa-solid fa-arrow-up',
+        position: 'right',
+        title: t`Scroll to previous reply`,
+        onClick: () => navigateReplies(-1),
+    },
+    {
+        id: 'extensionTopBarNavDown',
+        icon: 'fa-fw fa-solid fa-arrow-down',
+        position: 'right',
+        title: t`Scroll to next reply`,
+        onClick: () => navigateReplies(1),
+    },
+    {
+        id: 'extensionTopBarEditLastReply',
+        icon: 'fa-fw fa-solid fa-pen-to-square',
+        position: 'right',
+        title: t`Edit selected/last reply`,
+        onClick: onEditLastReplyClick,
+    },
+    {
+        id: 'extensionTopBarDeleteLastReply',
+        icon: 'fa-fw fa-solid fa-trash-can',
+        position: 'right',
+        title: t`Delete selected/last reply`,
+        onClick: onDeleteLastReplyClick,
+    },
+];
+
+const icons = [
+    {
+        id: 'extensionTopBarSettings',
+        icon: 'fa-fw fa-solid fa-cog',
+        position: 'right',
+        title: t`Toggle mode`,
+        onClick: toggleMode,
+    },
+    ...outOfChatIcons,
+    ...inChatIcons,
+];
+
+
+function toggleMode() {
+    isChatInOperationMode = !isChatInOperationMode;
+    updateTopBar();
+}
+
+function updateTopBar() {
+    const outOfChatIds = outOfChatIcons.map(it => it.id);
+    const inChatIds = inChatIcons.map(it => it.id);
+    const query = searchInput.value.trim();
+
+    if (isChatInOperationMode) {
+        outOfChatIds.forEach(id => document.getElementById(id)?.classList.add('displayNone'));
+        inChatIds.forEach(id => document.getElementById(id)?.classList.remove('displayNone'));
+        searchInput.placeholder = t`Search in chat...`;
+        searchChatsDebounced(''); // Clear chat list search
+        searchInChatDebounced(query);
+    } else {
+        outOfChatIds.forEach(id => document.getElementById(id)?.classList.remove('displayNone'));
+        inChatIds.forEach(id => document.getElementById(id)?.classList.add('displayNone'));
+        searchInput.placeholder = t`Search chats...`;
+        searchInChatDebounced(''); // Clear message highlight
+        searchChatsDebounced(query);
+    }
+    populateSideBar();
+}
+
+// Functions for edit mode
+function toggleEditButtons(isEditing) {
+    const normalButtons = [
+        'extensionTopBarToggleSidebar',
+        'extensionTopBarToggleConnectionProfiles',
+        'extensionTopBarNavUp',
+        'extensionTopBarNavDown',
+        'extensionTopBarEditLastReply',
+        'extensionTopBarDeleteLastReply',
+        'extensionTopBarChatManager',
+        'extensionTopBarNewChat',
+        'extensionTopBarRenameChat',
+        'extensionTopBarDeleteChat',
+        'extensionTopBarCloseChat',
+    ];
+    const editButtons = ['extensionTopBarConfirmEdit', 'extensionTopBarCancelEdit', 'extensionTopBarDeleteEdited'];
+
+    if (isEditing) {
+        normalButtons.forEach(id => document.getElementById(id)?.classList.add('displayNone'));
+        editButtons.forEach(id => document.getElementById(id)?.classList.remove('displayNone'));
+    } else {
+        normalButtons.forEach(id => document.getElementById(id)?.classList.remove('displayNone'));
+        editButtons.forEach(id => document.getElementById(id)?.classList.add('displayNone'));
+    }
+}
+
+function cleanupEditState() {
+    if (editStateObserver) {
+        editStateObserver.disconnect();
+        editStateObserver = null;
+    }
+    currentlyEditingMessage = null;
+    toggleEditButtons(false);
+}
+
+function onConfirmEditClick() {
+    if (!currentlyEditingMessage) return;
+    const confirmButton = currentlyEditingMessage.querySelector('.mes_edit_buttons .fa-check');
+    if (confirmButton) {
+        confirmButton.click();
+    }
+    cleanupEditState();
+}
+
+function onCancelEditClick() {
+    if (!currentlyEditingMessage) return;
+    const cancelButton = currentlyEditingMessage.querySelector('.mes_edit_buttons .fa-xmark');
+    if (cancelButton) {
+        cancelButton.click();
+    }
+    cleanupEditState();
+}
+
+function onDeleteEditedClick() {
+    if (!currentlyEditingMessage) return;
+    const deleteButton = currentlyEditingMessage.querySelector('.mes_edit_buttons .fa-trash-can');
+    if (deleteButton) {
+        deleteButton.click();
+    }
+    cleanupEditState();
+}
+
+// Functions for selective message operations
+async function onDeleteLastReplyClick() {
+    const chatContainer = document.getElementById('chat');
+    const navMessages = Array.from(chatContainer.querySelectorAll('.mes:not([is_system="true"])'));
+    const aiMessages = Array.from(chatContainer.querySelectorAll('.mes:not([is_user="true"]):not([is_system="true"])'));
+
+    if (aiMessages.length === 0 && (currentMessageIndex === -1 || !navMessages[currentMessageIndex])) {
+        executeSlashCommandsWithOptions(`/echo ${t`No reply found to delete.`}`);
+        return;
+    }
+
+    let messageToDelete;
+    if (currentMessageIndex !== -1 && navMessages[currentMessageIndex]) {
+        messageToDelete = navMessages[currentMessageIndex];
+    } else {
+        messageToDelete = aiMessages[aiMessages.length - 1];
+    }
+
+    const mesId = messageToDelete.getAttribute('mesid');
+    if (!mesId) {
+        executeSlashCommandsWithOptions(`/echo ${t`Selected message cannot be deleted.`}`);
+        return;
+    }
+
+    const confirm = await Popup.show.confirm(t`Are you sure you want to delete the selected reply?`);
+    if (confirm) {
+        await executeSlashCommandsWithOptions(`/del ${mesId}`);
+        currentMessageIndex = -1; // Reset navigation
+    }
+}
+
+async function onEditLastReplyClick() {
+    if (currentlyEditingMessage) {
+        onCancelEditClick();
+        return;
+    }
+
+    const chatContainer = document.getElementById('chat');
+    const navMessages = Array.from(chatContainer.querySelectorAll('.mes:not([is_system="true"])'));
+    const aiMessages = Array.from(chatContainer.querySelectorAll('.mes:not([is_user="true"]):not([is_system="true"])'));
+
+    if (aiMessages.length === 0) {
+        executeSlashCommandsWithOptions(`/echo ${t`No AI reply found to edit.`}`);
+        return;
+    }
+
+    let messageToEdit;
+    if (currentMessageIndex !== -1 && navMessages[currentMessageIndex]) {
+        messageToEdit = navMessages[currentMessageIndex];
+    } else {
+        messageToEdit = aiMessages[aiMessages.length - 1];
+    }
+
+    const editButton = messageToEdit.querySelector('.mes_button.mes_edit.fa-pencil');
+
+    if (editButton) {
+        editButton.click();
+
+        let found = false;
+        await waitUntilCondition(() => {
+            if (messageToEdit.querySelector('.mes_edit_buttons')) {
+                found = true;
+                return true; // Stop waiting
+            }
+            return false; // Continue waiting
+        }, 2000);
+
+        if (found) {
+            currentlyEditingMessage = messageToEdit;
+            toggleEditButtons(true);
+
+            editStateObserver = new MutationObserver(() => {
+                if (!messageToEdit.querySelector('.mes_edit_buttons')) {
+                    cleanupEditState();
+                }
+            });
+            editStateObserver.observe(messageToEdit, { childList: true, subtree: true });
+        } else {
+            executeSlashCommandsWithOptions(`/echo ${t`Could not enter edit mode.`}`);
+        }
+    } else {
+        executeSlashCommandsWithOptions(`/echo ${t`The selected message cannot be edited.`}`);
+    }
+}
+
+// Function for message navigation
+function navigateReplies(direction) {
+    const chatContainer = document.getElementById('chat');
+    const messages = Array.from(chatContainer.querySelectorAll('.mes:not([is_system="true"])'));
+    if (messages.length === 0) return;
+
+    if (currentMessageIndex === -1) {
+        currentMessageIndex = messages.length - 1;
+    } else {
+        currentMessageIndex += direction;
+    }
+
+    currentMessageIndex = Math.max(0, Math.min(messages.length - 1, currentMessageIndex));
+
+    const targetMessage = messages[currentMessageIndex];
+    if (targetMessage) {
+        targetMessage.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+}
+
+// Original functions from old file
 function onChatManagerClick() {
     document.getElementById('option_select_chat')?.click();
 }
@@ -120,71 +389,18 @@ async function onRenameChatClick() {
 }
 
 function patchSheldIfNeeded() {
-    // Fun fact: sheld is a typo. It should be shell.
-    // It was fixed in OG TAI long ago, but we still have it here.
     if (!sheld) {
-        console.error('Sheld not found. Did you finally rename it?');
+        console.error('Sheld not found.');
         return;
     }
-
     const computedStyle = getComputedStyle(sheld);
-    // Alert: We're not in a version that switched sheld to flex yet.
     if (computedStyle.display === 'grid') {
         sheld.classList.add('flexPatch');
     }
 }
 
-function applyOverlayPatch() {
-    const style = document.createElement('style');
-    style.id = 'sidebar-overlay-patch';
-    style.textContent = `
-        /* 使主容器成为绝对定位的参考点 */
-        #sheld {
-            position: relative;
-            overflow: hidden; /* 防止侧边栏溢出时出现滚动条 */
-        }
-
-        /* 将左右侧边栏设置为绝对定位，并置于顶层 */
-        #left-nav-panel, #right-nav-panel {
-            position: absolute;
-            top: 0;
-            bottom: 0;
-            z-index: 1000; /* 一个非常高的值确保在最上层 */
-            height: 100%;
-            overflow-y: auto;
-            /* 确保背景和过渡效果正确 */
-            background-color: var(--SillyTavernBlurTint);
-            transition: transform 0.3s ease-in-out;
-        }
-
-        #left-nav-panel {
-            left: 0;
-        }
-        #right-nav-panel {
-            right: 0;
-        }
-
-        /* 当侧边栏关闭时（通过 .closedDrawer 类控制），将其移出屏幕 */
-        #left-nav-panel.closedDrawer {
-            transform: translateX(-100%);
-        }
-        #right-nav-panel.closedDrawer {
-            transform: translateX(100%);
-        }
-
-        /* 确保打开时回到原位 */
-        #left-nav-panel:not(.closedDrawer) {
-            transform: translateX(0);
-        }
-        #right-nav-panel:not(.closedDrawer) {
-            transform: translateX(0);
-        }
-    `;
-    document.head.appendChild(style);
-    console.log('Sidebar overlay patch applied with correct selectors.');
-}
-
 function setChatName(name) {
+    currentMessageIndex = -1; // Reset navigation on chat change
     const isNotInChat = !name;
     chatName.innerHTML = '';
     const selectedOption = document.createElement('option');
@@ -193,6 +409,7 @@ function setChatName(name) {
     chatName.appendChild(selectedOption);
     chatName.disabled = true;
 
+    updateTopBar();
     icons.forEach(icon => {
         const iconElement = document.getElementById(icon.id);
         if (iconElement && !icon.isTemporaryAllowed) {
@@ -237,11 +454,6 @@ function setChatName(name) {
     }
 }
 
-/**
- * Get list of chat names for a character.
- * @param {string} avatar Avatar name of the character
- * @returns {Promise<string[]>} List of chat names
- */
 async function getListOfCharacterChats(avatar) {
     try {
         const result = await fetch('/api/characters/chats', {
@@ -281,11 +493,6 @@ async function getChatFiles() {
     return [];
 }
 
-/**
- * Highlight search query in chat messages
- * @param {string} query Search query
- * @returns {void}
- */
 function searchInChat(query) {
     const options = { element: 'mark', className: 'highlight' };
     const messages = jQuery(chat).find('.mes_text');
@@ -297,17 +504,44 @@ function searchInChat(query) {
     messages.highlight(splitQuery, options);
 }
 
-const searchDebounced = debounce((x) => searchInChat(x), 500);
+function searchChats(query) {
+    const container = document.getElementById('extensionSideBarContainer');
+    if (!container) return;
+
+    const items = container.querySelectorAll('.sideBarItem');
+    const lowerCaseQuery = query.toLowerCase();
+
+    items.forEach(item => {
+        const chatName = item.querySelector('.chatName')?.textContent.toLowerCase();
+        const chatMessage = item.querySelector('.chatMessage')?.textContent.toLowerCase();
+
+        if (!query || (chatName && chatName.includes(lowerCaseQuery)) || (chatMessage && chatMessage.includes(lowerCaseQuery))) {
+            item.style.display = 'flex';
+        } else {
+            item.style.display = 'none';
+        }
+    });
+}
+
+const searchInChatDebounced = debounce((x) => searchInChat(x), 500);
+const searchChatsDebounced = debounce((x) => searchChats(x), 500);
 const updateStatusDebounced = debounce(onOnlineStatusChange, 1000);
 
 function addTopBar() {
     chatName.id = 'extensionTopBarChatName';
     topBar.id = 'extensionTopBar';
     searchInput.id = 'extensionTopBarSearchInput';
-    searchInput.placeholder = 'Search...';
+    searchInput.placeholder = t`Search chats...`;
     searchInput.classList.add('text_pole');
     searchInput.type = 'search';
-    searchInput.addEventListener('input', () => searchDebounced(searchInput.value.trim()));
+    searchInput.addEventListener('input', () => {
+        const query = searchInput.value.trim();
+        if (isChatInOperationMode) {
+            searchInChatDebounced(query);
+        } else {
+            searchChatsDebounced(query);
+        }
+    });
     topBar.append(chatName, searchInput);
     sheld.insertBefore(topBar, chat);
 }
@@ -320,6 +554,9 @@ function addIcons() {
         iconElement.title = icon.title;
         iconElement.tabIndex = 0;
         iconElement.classList.add('right_menu_button');
+        if (icon.isHidden) {
+            iconElement.classList.add('displayNone');
+        }
         iconElement.addEventListener('click', () => {
             if (iconElement.classList.contains('not-in-chat')) {
                 return;
@@ -416,6 +653,46 @@ function bindConnectionProfilesSelect() {
     });
 }
 
+async function populateSideBarForInChat() {
+    const container = document.getElementById('extensionSideBarContainer');
+    const loader = document.getElementById('extensionSideBarLoader');
+
+    if (!loader || !container) {
+        return;
+    }
+    loader.classList.add('displayNone');
+    container.innerHTML = ''; // Clear it
+
+    const messages = Array.from(document.querySelectorAll('#chat .mes'));
+    messages.forEach(mes => {
+        const isSystem = mes.getAttribute('is_system') === 'true';
+        if (isSystem) return;
+
+        const isUser = mes.getAttribute('is_user') === 'true';
+        const author = isUser ? (mes.querySelector('.ch_name')?.textContent || 'User') : (mes.querySelector('.name')?.textContent || 'Character');
+        const text = mes.querySelector('.mes_text')?.textContent;
+
+        if (author && text) {
+            const sideBarItem = document.createElement('div');
+            sideBarItem.classList.add('sideBarItem');
+            sideBarItem.addEventListener('click', () => {
+                mes.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            });
+
+            const authorDiv = document.createElement('div');
+            authorDiv.classList.add('chatName'); // reuse style
+            authorDiv.textContent = author;
+
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('chatMessage'); // reuse style
+            messageDiv.textContent = text;
+
+            sideBarItem.append(authorDiv, messageDiv);
+            container.appendChild(sideBarItem);
+        }
+    });
+}
+
 async function onToggleSidebarClick() {
     const sidebar = document.getElementById('extensionSideBar');
     const toggle = document.getElementById('extensionTopBarToggleSidebar');
@@ -463,6 +740,11 @@ async function populateSideBar() {
 
     if (!sidebar.classList.contains('visible')) {
         container.innerHTML = '';
+        return;
+    }
+
+    if (isChatInOperationMode) {
+        await populateSideBarForInChat();
         return;
     }
 
@@ -717,7 +999,6 @@ function restorePanelsState() {
 (async function () {
     addJQueryHighlight();
     patchSheldIfNeeded();
-    applyOverlayPatch();
     addTopBar();
     addIcons();
     addSideBar();
@@ -725,6 +1006,17 @@ function restorePanelsState() {
     setChatName(getCurrentChatId());
     chatName.addEventListener('change', onChatNameChange);
     const setChatNameDebounced = debounce(() => setChatName(getCurrentChatId()), debounce_timeout.short);
+    const populateSideBarDebounced = debounce(() => {
+        if (document.getElementById('extensionSideBar')?.classList.contains('visible')) {
+            populateSideBar();
+        }
+    }, debounce_timeout.short);
+    const chatObserver = new MutationObserver(() => {
+        if (isChatInOperationMode) {
+            populateSideBarDebounced();
+        }
+    });
+    chatObserver.observe(chat, { childList: true });
     for (const eventName of [event_types.CHAT_CHANGED, event_types.CHAT_DELETED, event_types.GROUP_CHAT_DELETED]) {
         eventSource.on(eventName, setChatNameDebounced);
     }
